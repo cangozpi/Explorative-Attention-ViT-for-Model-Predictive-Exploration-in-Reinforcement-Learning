@@ -179,8 +179,9 @@ def main(args):
     global_step = 0
     undiscounted_episode_return = deque([], maxlen=100)
     episode_lengths = deque([], maxlen=100)
-    if 'Montezuma' in env_id:
-        number_of_visited_rooms = deque([], maxlen=100)
+
+    # MontezumaRevenge specific
+    number_of_visited_rooms = deque([], maxlen=100)
     total_num_visited_rooms = set() # id of every room visited so far in MontezumaRevenge
 
     if is_load_model:
