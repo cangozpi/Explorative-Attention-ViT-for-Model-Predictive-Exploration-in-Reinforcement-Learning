@@ -30,6 +30,11 @@ from config import default_config
 use_gae = default_config.getboolean('UseGAE')
 GAE_lambda = float(default_config['GAELambda'])
 
+from enum import Enum
+class Env_action_space_type(Enum):
+    DISCRETE = 0
+    CONTINUOUS = 1
+
 def init_tb_global_step():
     return 0
 
@@ -251,6 +256,8 @@ class Logger:
             wandb.define_metric('SSL_pretraining_epoch')
             wandb.define_metric('wandb_SSL_pretraining/*', step_metric='SSL_pretraining_epoch')
             wandb.define_metric('SSL_pretraining/*', step_metric='SSL_pretraining_epoch')
+
+            wandb.define_metric('total_num_steps_taken')
 
         # Initialize TensorBoard --------------------------------------------------------------------
         if tb_log_path is not None:

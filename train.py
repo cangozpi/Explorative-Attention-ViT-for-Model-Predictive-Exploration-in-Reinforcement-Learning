@@ -12,17 +12,22 @@ from dist_utils import ddp_setup, create_parallel_env_processes
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from utils import Env_action_space_type
 
 
 # from torch.distributed.elastic.multiprocessing.errors import record
 # @record
+@profile
 def main(args):
     logger = Logger(file_log_path=path.join("logs", "file_logs", args['log_name']), tb_log_path=path.join("logs", "tb_logs", args['log_name']))
 
     use_cuda = default_config.getboolean('UseGPU')
-    GLOBAL_WORLD_SIZE, GLOBAL_RANK, LOCAL_WORLD_SIZE, LOCAL_RANK, gpu_id = ddp_setup(logger, use_cuda)
+    GLOBAL_WORLD_SIZE, GLOBAL_RANK, LOCAL_WORLD_SIZE, LOCAL_RANK, gpu_id = ddp_setup(logger, use_cuda, int(args['gpu_id']))
     
-    dist.barrier() # wait for process initialization logging inside ddp_setup() to finish
+    if gpu_id == 'cpu':
+        dist.barrier() # wait for process initialization logging inside ddp_setup() to finish
+    else:
+        dist.barrier(device_ids=[int(gpu_id.split(':')[-1])]) # wait for process initialization logging inside ddp_setup() to finish
 
 
     logger.GLOBAL_RANK = GLOBAL_RANK
@@ -73,12 +78,17 @@ def main(args):
     else:
         input_size = env.observation_space.shape  # 4
 
-    if isinstance(env.action_space, gym.spaces.box.Box):
+    env_action_space_type = None
+    if isinstance(env.action_space, gym.spaces.box.Box):# Continuous action space
         output_size = env.action_space.shape[0]
-    else:
+        env_action_space_type = Env_action_space_type.CONTINUOUS
+    elif isinstance(env.action_space, gym.spaces.Discrete): # Discrete action space
         output_size = env.action_space.n  # 2
+        env_action_space_type = Env_action_space_type.DISCRETE
+    else:
+        raise Exception(f'Env is using an unsupperted action space: {env.action_space}')
 
-    if 'Breakout' in env_id: #TODO: not sure why this was done in other implementations
+    if 'Breakout' in env_id: # used for eliminating the <NOOP> action from the set of availble actions (i.e. avaiable actions become [1,2,3] where 0 was the <NOOP>)
         output_size -= 1
 
     env.close()
@@ -114,10 +124,10 @@ def main(args):
 
     reward_rms = RunningMeanStd(usage='reward_rms') # used for normalizing intrinsic rewards
     if train_method == 'original_RND':
-        obs_rms = RunningMeanStd(shape=(1, 1, input_size, input_size), usage='obs_rms') # used for normalizing observations
+        obs_rms = RunningMeanStd(shape=(1, 1, input_size, input_size), usage='obs_rms') # used for normalizing inputs to RND module (i.e. extracted_feature_embeddings)
     elif train_method == 'modified_RND':
         extracted_feature_embedding_dim = CnnActorCriticNetwork.extracted_feature_embedding_dim
-        obs_rms = RunningMeanStd(shape=(1, extracted_feature_embedding_dim), usage='obs_rms') # used for normalizing observations
+        obs_rms = RunningMeanStd(shape=(1, extracted_feature_embedding_dim), usage='obs_rms') # used for normalizing inputs to RND module (i.e. extracted_feature_embeddings)
     elif train_method == 'PPO':
         obs_rms = None
     pre_obs_norm_step = int(default_config['ObsNormStep'])
@@ -146,6 +156,7 @@ def main(args):
     agent = agent(
         input_size,
         output_size,
+        env_action_space_type,
         num_env_workers,
         num_step,
         gamma,
@@ -231,8 +242,8 @@ def main(args):
 
     agent = DDP(
         agent, 
-        device_ids=None if gpu_id == "cpu" else [gpu_id], 
-        output_device=None if gpu_id == "cpu" else gpu_id,
+        #device_ids=None if gpu_id == "cpu" else [gpu_id], 
+        #output_device=None if gpu_id == "cpu" else gpu_id,
         )
     
     agent_PPO_total_params = sum(p.numel() for p in agent.module.model.parameters())
@@ -254,14 +265,29 @@ def main(args):
         for p1 in agent.module.model.feature.parameters():
             p1.requires_grad = True
     if representation_lr_method != 'None':
-        for p1, p2 in zip(agent.module.model.feature.parameters(), agent.module.representation_model.get_trainable_parameters()):
+        for p1, p2 in zip(agent.module.model.feature.parameters(), agent.module.representation_model.net.parameters()):
             assert p1.requires_grad == p2.requires_grad, "shared backbone is not frozen in all models, something is wrong with parameter sharing !" # make sure shared backbone is frozen in every sharing model
                 
 
     agent.module.set_mode("train")
 
 
+    # Get the initial reset states from newly initialized envs
     states = np.zeros([num_env_workers, stateStackSize, input_size, input_size])
+    for env_idx, parent_conn in enumerate(env_worker_parent_conns):
+        s = parent_conn.recv()
+        assert (list(s.shape) == [stateStackSize, input_size, input_size]) and (s.dtype == np.float64)
+        states[env_idx] = s[:]
+
+    # plots states for debugging purposes
+    if False:
+        import matplotlib.pyplot as plt
+        fig, axs = plt.subplots(3, 4)
+        for env_idx in range(num_env_workers):
+            for stack_idx in range(stateStackSize):
+                axs[env_idx, stack_idx].imshow(np.expand_dims(states[env_idx, stack_idx], axis=2), cmap='gray')
+                axs[env_idx, stack_idx].set_title(f'env: {env_idx}, frame: {stack_idx}', fontsize=10)
+        plt.show()
 
     # SSL pretraining:
     if SSL_pretraining == True:
@@ -280,9 +306,19 @@ def main(args):
             def __len__(self):
                 return self.total_states.shape[0]
                     
+            @torch.no_grad()
             def __getitem__(self, idx):
                 # send data to GPU and convert to required dtypes
-                s = torch.FloatTensor(self.total_states[idx]).unsqueeze(0).to(self.device) # [B=1, C=STATE_STACK_SIZE, H, W]
+                # s = torch.FloatTensor(self.total_states[idx]).unsqueeze(0).to(self.device) # [B=1, C=STATE_STACK_SIZE, H, W]
+                # assert list(s.shape) == [1, stateStackSize, input_size, input_size]
+
+                # s_views = self.transform(s) # -> [B, C=STATE_STACK_SIZE, H, W], [B, C=STATE_STACK_SIZE, H, W]
+                # s_view1, s_view2 = torch.reshape(s_views[0], [stateStackSize, input_size, input_size]), \
+                #     torch.reshape(s_views[1], [stateStackSize, input_size, input_size]) # -> [STATE_STACK_SIZE, H, W], [STATE_STACK_SIZE, H, W]
+                # assert (list(s_view1.shape) == [stateStackSize, input_size, input_size]) and (list(s_view2.shape) == [stateStackSize, input_size, input_size])
+
+                # return s_view1, s_view2
+                s = torch.FloatTensor(self.total_states[idx]).unsqueeze(0).to('cpu') # [B=1, C=STATE_STACK_SIZE, H, W]
                 assert list(s.shape) == [1, stateStackSize, input_size, input_size]
 
                 s_views = self.transform(s) # -> [B, C=STATE_STACK_SIZE, H, W], [B, C=STATE_STACK_SIZE, H, W]
@@ -290,7 +326,7 @@ def main(args):
                     torch.reshape(s_views[1], [stateStackSize, input_size, input_size]) # -> [STATE_STACK_SIZE, H, W], [STATE_STACK_SIZE, H, W]
                 assert (list(s_view1.shape) == [stateStackSize, input_size, input_size]) and (list(s_view2.shape) == [stateStackSize, input_size, input_size])
 
-                return s_view1, s_view2
+                return s_view1.to(self.device), s_view2.to(self.device)
 
         if agent.module.representation_lr_method == "BYOL":
             assert agent.module.representation_model.net is agent.module.model.feature # make sure that BYOL net and RL algo's feature extractor both point to the same network
@@ -304,15 +340,19 @@ def main(args):
         SSL_eval_dataloader = None
 
         while True:
-            total_state = []
+            total_state = np.zeros((num_env_workers*num_step, stateStackSize, input_size, input_size), dtype=np.float64)
             for j in range(num_step):
                 # Collect rollout:
-                actions = np.random.randint(0, output_size, size=(num_env_workers,)).astype(dtype=np.int64) # Note that random action taking might be an issue which results in same images being used for training 
+                if env_action_space_type == Env_action_space_type.DISCRETE:
+                    actions = np.random.randint(0, output_size, size=(num_env_workers,)).astype(dtype=np.int64) # Note that random action taking might be an issue which results in same images being used for training
+                elif env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    actions = np.random.uniform(low=0.0, high=1.0, size=(num_env_workers,)).astype(dtype=np.float32)
+                    actions = np.expand_dims(actions, axis=-1)
 
                 for parent_conn, action in zip(env_worker_parent_conns, actions):
                     parent_conn.send(action)
                 
-                next_states = []
+                next_states = np.zeros([num_env_workers, stateStackSize, input_size, input_size], dtype=np.float64) # -> [num_env, state_stack_size, H, W]
                 for env_idx, parent_conn in enumerate(env_worker_parent_conns):
                     s, r, d, trun, visited_rooms = parent_conn.recv()
                     assert (list(s.shape) == [stateStackSize, input_size, input_size]) and (s.dtype == np.float64)
@@ -320,7 +360,7 @@ def main(args):
                     assert type(d) == bool
                     assert type(trun) == bool
 
-                    next_states.append(s)
+                    next_states[env_idx] = s[:]
 
                     if d or trun:
                         info = {'episode': {}}
@@ -337,10 +377,9 @@ def main(args):
                             logger.log_msg_to_both_console_and_file(f'[Rank: {GLOBAL_RANK}, env: {env_idx} ] episode: {info["episode"]["num_finished_episodes"]}, step: {info["episode"]["l"]}, undiscounted_return: {info["episode"]["undiscounted_episode_return"]}, moving_average_undiscounted_return: {np.mean(info["episode"]["undiscounted_episode_return"])}')
 
 
-                next_states = np.stack(next_states) # -> [num_env, state_stack_size, H, W]
                 assert (list(next_states.shape) == [num_env_workers, stateStackSize, input_size, input_size]) and (next_states.dtype == np.float64)
 
-                total_state.append(states)
+                total_state[(j * num_env_workers): (j * num_env_workers) + num_env_workers] = states[:]
 
                 states = next_states[:, :, :, :] # for an explanation of why [:, :, :, :] is used refer to the discussion: https://stackoverflow.com/questions/61103275/what-is-the-difference-between-tensor-and-tensor-in-pytorch 
 
@@ -348,7 +387,7 @@ def main(args):
                     renderer.render(next_states[:, -1, :, :].reshape([num_env_workers, 1, input_size, input_size])) # [num_env, 1, input_size, input_size]
                 
 
-            total_state = np.stack(total_state).transpose([1, 0, 2, 3, 4]).reshape([-1, stateStackSize, input_size, input_size]) # --> [num_env * num_step, state_stack_size, H, W]
+            total_state = total_state.reshape([num_step, num_env_workers, stateStackSize, input_size, input_size]).transpose(1, 0, 2, 3, 4).reshape([-1, stateStackSize, input_size, input_size]) # --> [num_env * num_step, state_stack_size, H, W]
             assert (list(total_state.shape) == [num_env_workers*num_step, stateStackSize, input_size, input_size]) and (total_state.dtype == np.float64) 
                     
             if SSL_eval_dataloader == None: # first collected rollout will be used as the evaluation data
@@ -407,18 +446,18 @@ def main(args):
                 SSL_training_epoch_losses = np.mean(SSL_training_cur_epoch_losses)
             
                 # Evaluate SSL model
-                SSL_training_cur_epoch_losses = []
+                SSL_evaluation_cur_epoch_losses = []
                 for s_batch_view1, s_batch_view2 in SSL_eval_dataloader:
                     # s_batch_view1, s_batch_view2 --> [B, STATE_STACK_SIZE, H, W], [B, STATE_STACK_SIZE, H, W]
                     assert (list(s_batch_view1.shape) == [batch_size, stateStackSize, input_size, input_size]) and (list(s_batch_view2.shape) == [batch_size, stateStackSize, input_size, input_size])
                     assert (s_batch_view1.device == torch.device(agent.module.device)) and (s_batch_view2.device == torch.device(agent.module.device))
 
-                    # Train SSL model
+                    # Evaluate SSL model
                     with torch.no_grad():
                         representation_loss = agent.module.representation_model(s_batch_view1, s_batch_view2) 
                     # logging
-                    SSL_training_cur_epoch_losses.append(representation_loss.detach().cpu().item())
-                SSL_evaluation_epoch_loss = np.mean(SSL_training_cur_epoch_losses)
+                    SSL_evaluation_cur_epoch_losses.append(representation_loss.detach().cpu().item())
+                SSL_evaluation_epoch_loss = np.mean(SSL_evaluation_cur_epoch_losses)
 
 
                 # Logging:
@@ -447,13 +486,16 @@ def main(args):
             
                     # save checkpoint
                     save_ckpt(-1, num_env_workers, num_step, default_config, highest_mean_total_reward, [], highest_mean_undiscounted_episode_return, undiscounted_episode_return, GLOBAL_RANK, \
-                        logger,agent, representation_lr_method, obs_rms, reward_rms, discounted_reward, global_update, episode_lengths, number_of_visited_rooms, env_id, save_ckpt_path, best_SSL_evaluation_epoch_loss, SSL_evaluation_epoch_loss, logger.tb_global_steps['SSL_pretraining_epoch'])
+                        logger, agent, representation_lr_method, obs_rms, reward_rms, discounted_reward, global_update, episode_lengths, \
+                             number_of_visited_rooms, total_num_visited_rooms, env_id, save_ckpt_path, best_SSL_evaluation_epoch_loss, SSL_evaluation_epoch_loss, logger.tb_global_steps['SSL_pretraining_epoch'])
 
                     # update best score
                     if best_SSL_evaluation_epoch_loss > SSL_evaluation_epoch_loss:
                         best_SSL_evaluation_epoch_loss = SSL_evaluation_epoch_loss
 
                     logger.tb_global_steps['SSL_pretraining_epoch'] = logger.tb_global_steps['SSL_pretraining_epoch'] + 1
+            
+            logger.check_scalene_profiler_finished() # scalene profiler
 
 
         
@@ -462,9 +504,17 @@ def main(args):
         logger.log_msg_to_both_console_and_file('Start to initialize observation normalization parameter.....', only_rank_0=True)
         if is_render:
             renderer = ParallelizedEnvironmentRenderer(num_env_workers)
-        next_obs = []
+        if train_method == 'original_RND':
+            next_obs = np.zeros([num_env_workers * num_step, 1, input_size, input_size])
+        elif train_method == 'modified_RND':
+            next_obs = np.zeros([num_env_workers * num_step, stateStackSize, input_size, input_size])
+        elif train_method == 'PPO':
+            next_obs = np.zeros([num_env_workers * num_step, stateStackSize, input_size, input_size])
         for step in range(num_step * pre_obs_norm_step):
-            actions = np.random.randint(0, output_size, size=(num_env_workers,)).astype(dtype=np.int64)
+            if env_action_space_type == Env_action_space_type.DISCRETE:
+                actions = np.random.randint(0, output_size, size=(num_env_workers,)).astype(dtype=np.int64)
+            elif env_action_space_type == Env_action_space_type.CONTINUOUS:
+                actions = np.random.uniform(low=env.action_space.low.item(), high=env.action_space.high.item(), size=(num_env_workers, output_size)).astype(dtype=np.float32)
 
             for parent_conn, action in zip(env_worker_parent_conns, actions):
                 parent_conn.send(action)
@@ -488,23 +538,23 @@ def main(args):
                         logger.log_msg_to_both_console_and_file(f'[Rank: {GLOBAL_RANK}, env: {env_idx} ] episode: {info["episode"]["num_finished_episodes"]}, step: {info["episode"]["l"]}, undiscounted_return: {info["episode"]["undiscounted_episode_return"]}, moving_average_undiscounted_return: {np.mean(info["episode"]["undiscounted_episode_return"])}')
 
                 if train_method == 'original_RND':
-                    next_obs.append(s[stateStackSize - 1, :, :].reshape([1, input_size, input_size])) # [1, input_size, input_size]
+                    next_obs[((step * num_env_workers) + env_idx) % (num_step * num_env_workers), :, :, :] = s[stateStackSize - 1, :, :].reshape([1, input_size, input_size]) # [1, input_size, input_size]
                 elif train_method == 'modified_RND':
-                    next_obs.append(s) # [stateStackSize, input_size, input_size]
+                    next_obs[((step * num_env_workers) + env_idx) % (num_step * num_env_workers), :, :, :] = s # [stateStackSize, input_size, input_size]
                 elif (train_method == 'PPO') and is_render: # next_obs is just used for rendering purposes
-                    next_obs.append(s) # [stateStackSize, input_size, input_size]
+                    next_obs[((step * num_env_workers) + env_idx) % (num_step * num_env_workers), :, :, :] = s # [stateStackSize, input_size, input_size]
                 
 
             if is_render:
                 if train_method == 'original_RND':
-                    renderer.render(np.stack(next_obs[-num_env_workers:])) # [num_env, 1, input_size, input_size]
+                    renderer.render(next_obs[((step * num_env_workers) % (num_step * num_env_workers)):((step * num_env_workers) % (num_step * num_env_workers)) + num_env_workers]) # [num_env, 1, input_size, input_size]
                 elif train_method == 'modified_RND':
-                    renderer.render(np.stack(next_obs[-num_env_workers:])[:, -1, :, :].reshape([num_env_workers, 1, input_size, input_size])) # [num_env, 1, input_size, input_size]
+                    renderer.render(next_obs[((step * num_env_workers) % (num_step * num_env_workers)):((step * num_env_workers) % (num_step * num_env_workers)) + num_env_workers][:, -1, :, :].reshape([num_env_workers, 1, input_size, input_size])) # [num_env, 1, input_size, input_size]
                 elif train_method == 'PPO':
-                    renderer.render(np.stack(next_obs[-num_env_workers:])[:, -1, :, :].reshape([num_env_workers, 1, input_size, input_size])) # [num_env, 1, input_size, input_size]
+                    renderer.render(next_obs[((step * num_env_workers) % (num_step * num_env_workers)):((step * num_env_workers) % (num_step * num_env_workers)) + num_env_workers][:, -1, :, :].reshape([num_env_workers, 1, input_size, input_size])) # [num_env, 1, input_size, input_size]
             if train_method in ['original_RND', 'modified_RND']:
                 if len(next_obs) % (num_step * num_env_workers) == 0:
-                    next_obs = np.stack(next_obs) # modified_RND: [(num_step * num_env_workers), stateStackSize, input_size, input_size], original_RND:[(num_step * num_env_workers), 1, input_size, input_size]
+                    # next_obs --> modified_RND: [(num_step * num_env_workers), stateStackSize, input_size, input_size], original_RND:[(num_step * num_env_workers), 1, input_size, input_size]
                     if train_method == 'original_RND':
                         assert (list(next_obs.shape) == [num_step*num_env_workers, 1, input_size, input_size])
                         obs_rms.update(next_obs)
@@ -514,12 +564,11 @@ def main(args):
                             extracted_feature_embeddings = agent.module.extract_feature_embeddings(next_obs / 255).cpu().numpy() # [(num_step * num_env_workers), feature_embeddings_dim]
                             assert (list(extracted_feature_embeddings.shape) == [num_step*num_env_workers, extracted_feature_embedding_dim])
                         obs_rms.update(extracted_feature_embeddings)
-                    next_obs = []
         if is_render:
             renderer.close()
         logger.log_msg_to_both_console_and_file('End to initialize...', only_rank_0=True)
     
- 
+
 
     if is_render:
         renderer = ParallelizedEnvironmentRenderer(num_env_workers)
@@ -530,23 +579,49 @@ def main(args):
 
     while True:
 
-        total_state, total_reward, total_done, total_action, total_int_reward, total_next_obs, total_ext_values, total_int_values, total_policy = \
-            [], [], [], [], [], [], [], [], []
+        total_state = np.zeros([num_env_workers * num_step, stateStackSize, input_size, input_size], dtype=np.float64)
+        total_reward = np.zeros([num_env_workers * num_step], dtype=np.float64)
+        if env_action_space_type == Env_action_space_type.DISCRETE:
+            total_action = np.zeros([num_env_workers * num_step, ], dtype=np.int64)
+        elif env_action_space_type == Env_action_space_type.CONTINUOUS:
+            total_action = np.zeros([num_env_workers * num_step, output_size], dtype=np.float32)
+        total_done = np.zeros([num_env_workers * num_step], dtype=np.bool_)
+        if train_method == 'original_RND':
+            total_next_obs = np.zeros([num_env_workers*num_step, 1, input_size, input_size], dtype=np.float64)
+        elif train_method == 'modified_RND':
+            total_next_obs = np.zeros([num_env_workers*num_step, stateStackSize, input_size, input_size], dtype=np.float64)
+        total_ext_values = np.zeros([num_env_workers * (num_step + 1)], dtype=np.float32)
+        total_int_values = np.zeros([num_env_workers * (num_step + 1)], dtype=np.float32)
+        if env_action_space_type == Env_action_space_type.DISCRETE:
+            total_policy = np.zeros([num_step * num_env_workers, output_size], dtype=np.float32)
+        elif env_action_space_type == Env_action_space_type.CONTINUOUS:
+            total_policy = np.zeros([num_step * num_env_workers, 1], dtype=np.float32)
+        total_int_reward = np.zeros([num_step * num_env_workers], dtype=np.float32)
         global_step += (num_env_workers * num_step)
         global_update += 1
 
         # Step 1. n-step rollout
         for step in range(num_step):
-            actions, value_ext, value_int, policy = agent.module.get_action(np.float32(states) / 255.)
-            assert (list(actions.shape) == [num_env_workers, ]) and (actions.dtype == np.int64)
+            actions, value_ext, value_int, policy = agent.module.get_action(np.float32(states) / 255.) # Note: if action space is Continuous then policy 'correpsonds' to 'logp_a'
+            if env_action_space_type == Env_action_space_type.DISCRETE:
+                assert (list(actions.shape) == [num_env_workers, ]) and (actions.dtype == np.int64)
+                assert (list(policy.shape) == [num_env_workers, output_size]) and (policy.dtype == np.float32)
+            elif env_action_space_type == Env_action_space_type.CONTINUOUS:
+                assert (list(actions.shape) == [num_env_workers, output_size]) and (actions.dtype == np.float32)
+                assert (list(policy.shape) == [num_env_workers, 1]) and (policy.dtype == np.float32)
             assert (list(value_ext.shape) == [num_env_workers, ]) and (value_ext.dtype == np.float32)
             assert (list(value_int.shape) == [num_env_workers, ]) and (value_ext.dtype == np.float32)
-            assert (list(policy.shape) == [num_env_workers, output_size]) and (policy.dtype == np.float32)
 
             for parent_conn, action in zip(env_worker_parent_conns, actions):
                 parent_conn.send(action)
 
-            next_states, rewards, dones, next_obs = [], [], [], []
+            next_states = np.zeros([num_env_workers, stateStackSize, input_size, input_size], dtype=np.float64) # -> [num_env, state_stack_size, H, W]
+            rewards = np.zeros([num_env_workers,], dtype=np.float64)
+            dones = np.zeros([num_env_workers, ], dtype=np.bool_)
+            if train_method == 'original_RND':
+                next_obs = np.zeros([num_env_workers, 1, input_size, input_size], dtype=np.float64)
+            elif train_method == 'modified_RND':
+                next_obs = np.zeros([num_env_workers, stateStackSize, input_size, input_size], dtype=np.float64)
             for env_idx, parent_conn in enumerate(env_worker_parent_conns):
                 s, r, d, trun, visited_rooms = parent_conn.recv()
                 assert (list(s.shape) == [stateStackSize, input_size, input_size]) and (s.dtype == np.float64)
@@ -554,14 +629,15 @@ def main(args):
                 assert type(d) == bool
                 assert type(trun) == bool
 
-                next_states.append(s)
-                rewards.append(r)
-                dones.append(d) # --> [num_env]
+                next_states[env_idx] = s[:]
+                rewards[env_idx] = r
+                dones[env_idx] = d
+
                 total_num_visited_rooms = total_num_visited_rooms.union(visited_rooms)
                 if train_method == 'original_RND':
-                    next_obs.append(s[(stateStackSize - 1), :, :].reshape([1, input_size, input_size])) # [1, input_size, input_size]
+                    next_obs[env_idx] = s[(stateStackSize - 1), :, :].reshape([1, input_size, input_size])[:] # [1, input_size, input_size]
                 elif train_method == 'modified_RND':
-                    next_obs.append(s) # [stateStackSize, input_size, input_size]
+                    next_obs[env_idx] = s[:] # [extstateStackSize, input_size, input_size]
 
                 if d or trun:
                     info = {'episode': {}}
@@ -578,14 +654,9 @@ def main(args):
                         logger.log_msg_to_both_console_and_file(f'[Rank: {GLOBAL_RANK}, env: {env_idx} ] episode: {info["episode"]["num_finished_episodes"]}, step: {info["episode"]["l"]}, undiscounted_return: {info["episode"]["undiscounted_episode_return"]}, moving_average_undiscounted_return: {np.mean(info["episode"]["undiscounted_episode_return"])}')
 
 
-            next_states = np.stack(next_states) # -> [num_env, state_stack_size, H, W]
-            rewards = np.hstack(rewards) # -> [num_env, ]
-            dones = np.hstack(dones) # -> [num_env, ]
             assert (list(next_states.shape) == [num_env_workers, stateStackSize, input_size, input_size]) and (next_states.dtype == np.float64)
             assert (list(rewards.shape) == [num_env_workers, ]) and (rewards.dtype == np.float64)
             assert (list(dones.shape) == [num_env_workers, ]) and (dones.dtype == np.bool_)
-            if train_method in ['original_RND', 'modified_RND']:
-                next_obs = np.stack(next_obs) # -> modified_RND: [num_env, stateStackSize, H, W], original_RND: [num_env, 1, H, W]
 
             # Compute normalize obs, compute intrinsic rewards and clip them (note that: total reward = int reward + ext reward)
             if train_method == 'original_RND':
@@ -602,18 +673,18 @@ def main(args):
                         ((extracted_feature_embeddings - obs_rms.mean) / np.sqrt(obs_rms.var)).clip(-5, 5)) # -> [num_env, ]
 
             if train_method in ['original_RND', 'modified_RND']:
-                intrinsic_reward = np.hstack(intrinsic_reward) # [num_env,]
+                total_int_reward[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = intrinsic_reward[:]
+                total_next_obs[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = next_obs[:]
+                # total_next_obs --> modified_RND: [num_step, num_env, state_stack_size, H, W], original_RND: [num_step, num_env, 1, H, W]
 
-            total_next_obs.append(next_obs) # --> modified_RND: [num_step, num_env, state_stack_size, H, W], original_RND: [num_step, num_env, 1, H, W]
-            if train_method in ['original_RND', 'modified_RND']:
-                total_int_reward.append(intrinsic_reward)
-            total_state.append(states)
-            total_reward.append(rewards)
-            total_done.append(dones)
-            total_action.append(actions)
-            total_ext_values.append(value_ext)
-            total_int_values.append(value_int)
-            total_policy.append(policy)
+            total_state[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = states[:]
+            total_reward[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = rewards[:]
+
+            total_done[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = dones[:]
+            total_action[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = actions[:]
+            total_ext_values[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = value_ext[:]
+            total_int_values[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = value_int[:]
+            total_policy[(step * num_env_workers) : (step * num_env_workers) + num_env_workers] = policy[:]
 
             states = next_states[:, :, :, :] # for an explanation of why [:, :, :, :] is used refer to the discussion: https://stackoverflow.com/questions/61103275/what-is-the-difference-between-tensor-and-tensor-in-pytorch 
 
@@ -629,36 +700,40 @@ def main(args):
         # calculate last next value
         with torch.no_grad():
             _, value_ext, value_int, _ = agent.module.get_action(np.float32(states) / 255.)
-        total_ext_values.append(value_ext)
-        total_int_values.append(value_int)
+        total_ext_values[((step+1) * num_env_workers) : ((step+1) * num_env_workers) + num_env_workers] = value_ext
+        total_int_values[((step+1) * num_env_workers) : ((step+1) * num_env_workers) + num_env_workers] = value_int
         # --------------------------------------------------
 
-        total_state = np.stack(total_state).transpose([1, 0, 2, 3, 4]).reshape([-1, stateStackSize, input_size, input_size]) # --> [num_env * num_step, state_stack_size, H, W]
-        total_reward = np.stack(total_reward).transpose().clip(-1, 1) # --> [num_env, num_step]
-        total_action = np.stack(total_action).transpose().reshape([-1]) # --> [num_env * num_step]
-        total_done = np.stack(total_done).transpose() # --> [num_env, num_step]
+        total_state = total_state.reshape([num_step, num_env_workers, stateStackSize, input_size, input_size]).transpose(1, 0, 2, 3, 4).reshape([-1, stateStackSize, input_size, input_size]) # --> [num_env * num_step, state_stack_size, H, W]
+        total_reward = total_reward.reshape([num_step, num_env_workers]).transpose().clip(-1, 1) # --> [num_env, num_step]
+        total_action = total_action.reshape([num_step, num_env_workers]).transpose().reshape([-1]) # --> [num_env * num_step]
+        total_done = total_done.reshape([num_step, num_env_workers]).transpose().reshape([num_env_workers, num_step])
         if train_method == 'original_RND':
-            total_next_obs = np.stack(total_next_obs).transpose([1, 0, 2, 3, 4]).reshape([-1, 1, input_size, input_size]) # --> [num_env * num_step, 1, H, W]
+            total_next_obs = total_next_obs.reshape([num_step, num_env_workers, 1, input_size, input_size]).transpose([1, 0, 2, 3, 4]).reshape([num_env_workers * num_step, 1, input_size, input_size]) # --> [num_env * num_step, 1, H, W]
             assert (list(total_next_obs.shape) == [num_env_workers*num_step, 1, input_size, input_size]) and (total_next_obs.dtype == np.float64)
         elif train_method == 'modified_RND':
-            total_next_obs = np.stack(total_next_obs).transpose([1, 0, 2, 3, 4]).reshape([-1, stateStackSize, input_size, input_size]) # --> [num_env * num_step, state_stack_size, H, W]
+            total_next_obs = total_next_obs.reshape([num_step, num_env_workers, stateStackSize, input_size, input_size]).transpose([1, 0, 2, 3, 4]).reshape([num_env_workers * num_step, stateStackSize, input_size, input_size]) # --> [num_env * num_step, state_stack_size, H, W]
             assert (list(total_next_obs.shape) == [num_env_workers*num_step, stateStackSize, input_size, input_size]) and (total_next_obs.dtype == np.float64)
-        total_ext_values = np.stack(total_ext_values).transpose() # --> [num_env, (num_step + 1)]
-        total_int_values = np.stack(total_int_values).transpose() # --> [num_env, (num_step + 1)]
-        total_policy = np.stack(total_policy) # --> [num_step, num_env, output_size]
+        total_ext_values = total_ext_values.reshape([(num_step + 1), num_env_workers]).transpose().reshape(num_env_workers, (num_step + 1))
+        total_int_values = total_int_values.reshape([(num_step + 1), num_env_workers]).transpose().reshape(num_env_workers, (num_step + 1))
+        total_policy = total_policy.reshape([num_step, num_env_workers, -1]) # --> [num_step, num_env, output_size]
         assert (list(total_state.shape) == [num_env_workers*num_step, stateStackSize, input_size, input_size]) and (total_state.dtype == np.float64)
         assert (list(total_reward.shape) == [num_env_workers, num_step]) and (total_reward.dtype == np.float64)
-        assert (list(total_action.shape) == [num_env_workers*num_step]) and (total_action.dtype == np.int64)
         assert (list(total_done.shape) == [num_env_workers, num_step]) and (total_done.dtype == np.bool_)
         assert (list(total_ext_values.shape) == [num_env_workers, (num_step + 1)]) and (total_ext_values.dtype == np.float32)
         assert (list(total_int_values.shape) == [num_env_workers, (num_step + 1)]) and (total_int_values.dtype == np.float32)
-        assert (list(total_policy.shape) == [num_step, num_env_workers, output_size]) and (total_policy.dtype == np.float32)
+        if env_action_space_type == Env_action_space_type.DISCRETE:
+            assert (list(total_action.shape) == [num_env_workers*num_step]) and (total_action.dtype == np.int64)
+            assert (list(total_policy.shape) == [num_step, num_env_workers, output_size]) and (total_policy.dtype == np.float32)
+        elif env_action_space_type == Env_action_space_type.CONTINUOUS:
+            assert (list(total_action.shape) == [num_env_workers*num_step]) and (total_action.dtype == np.float32)
+            assert (list(total_policy.shape) == [num_step, num_env_workers, 1]) and (total_policy.dtype == np.float32)
 
 
         # Step 2. calculate intrinsic reward
         if train_method in ['original_RND', 'modified_RND']:
             # running mean intrinsic reward
-            total_int_reward = np.stack(total_int_reward).transpose() # --> [num_env, num_step]
+            total_int_reward = total_int_reward.reshape([num_step, num_env_workers]).transpose().reshape([num_env_workers, num_step]) # --> [num_env, num_step]
             total_reward_per_env = np.array([discounted_reward.update(reward_per_step) for reward_per_step in
                                             total_int_reward.T])
             mean, std, count = np.mean(total_reward_per_env), np.std(total_reward_per_env), len(total_reward_per_env)
@@ -709,11 +784,18 @@ def main(args):
         if logger.use_wandb and GLOBAL_RANK == 0:
             parameterUpdates_log_dict = {
                 'data/Mean of rollout rewards (extrinsic) vs Parameter updates': np.mean(total_reward),
+                'data/Sum of rollout rewards (extrinsic) vs Parameter updates': np.sum(total_reward),
             }
             if train_method in ['original_RND', 'modified_RND']:
                 parameterUpdates_log_dict = {
                     **parameterUpdates_log_dict,
                     'data/Mean of rollout rewards (intrinsic) vs Parameter updates': np.mean(total_int_reward),
+                    'data/Sum of rollout rewards (intrinsic) vs Parameter updates': np.sum(total_int_reward),
+                    'data/Max of rollout rewards (intrinsic) vs Parameter updates': np.max(total_int_reward),
+                    'data/np.mean(obs_rms.mean) vs Parameter updates': np.mean(obs_rms.mean),
+                    'data/np.mean(obs_rms.var) vs Parameter updates': np.mean(obs_rms.var),
+                    'data/np.mean(reward_rms.mean) vs Parameter updates': np.mean(reward_rms.mean),
+                    'data/np.mean(reward_rms.var) vs Parameter updates': np.mean(reward_rms.var),
                 } 
             if len(episode_lengths) > 0: # check if any episode has been completed yet
                 parameterUpdates_log_dict = {
@@ -731,13 +813,21 @@ def main(args):
             parameterUpdates_log_dict = {f'wandb_{k}': v for (k, v) in parameterUpdates_log_dict.items()}
             wandb.log({
                 'parameter updates': global_update,
+                'total_num_steps_taken': global_step,
                 **parameterUpdates_log_dict
             })
 
         # Logging (tb):
         logger.log_scalar_to_tb_with_step('data/Mean of rollout rewards (extrinsic) vs Parameter updates', np.mean(total_reward), global_update, only_rank_0=True)
+        logger.log_scalar_to_tb_with_step('data/Sum of rollout rewards (extrinsic) vs Parameter updates', np.sum(total_reward), global_update, only_rank_0=True)
         if train_method in ['original_RND', 'modified_RND']:
             logger.log_scalar_to_tb_with_step('data/Mean of rollout rewards (intrinsic) vs Parameter updates', np.mean(total_int_reward), global_update, only_rank_0=True)
+            logger.log_scalar_to_tb_with_step('data/Sum of rollout rewards (intrinsic) vs Parameter updates', np.sum(total_int_reward), global_update, only_rank_0=True)
+            logger.log_scalar_to_tb_with_step('data/Max of rollout rewards (intrinsic) vs Parameter updates', np.max(total_int_reward), global_update, only_rank_0=True)
+            logger.log_scalar_to_tb_with_step('data/np.mean(obs_rms.mean) vs Parameter updates', np.mean(obs_rms.mean), global_update, only_rank_0=True)
+            logger.log_scalar_to_tb_with_step('data/np.mean(obs_rms.var) vs Parameter updates', np.mean(obs_rms.var), global_update, only_rank_0=True)
+            logger.log_scalar_to_tb_with_step('data/np.mean(reward_rms.mean) vs Parameter updates', np.mean(reward_rms.mean), global_update, only_rank_0=True)
+            logger.log_scalar_to_tb_with_step('data/np.mean(reward_rms.var) vs Parameter updates', np.mean(reward_rms.var), global_update, only_rank_0=True)
         if len(episode_lengths) > 0: # check if any episode has been completed yet
             logger.log_scalar_to_tb_with_step('data/Mean undiscounted episodic return (over last 100 episodes) (extrinsic) vs Parameter updates', np.mean(undiscounted_episode_return), global_update, only_rank_0=True)
             logger.log_scalar_to_tb_with_step('data/Mean episode lengths (over last 100 episodes) vs Parameter updates', np.mean(episode_lengths), global_update, only_rank_0=True)
@@ -774,7 +864,10 @@ def main(args):
                             total_policy, global_update)
         logger.log_msg_to_both_console_and_file(f'[RANK:{GLOBAL_RANK} | {gpu_id}] global_step: {global_step}, global_update: {global_update} | EXITTED TRAINING')
             
-        dist.barrier()
+        if gpu_id == 'cpu':
+            dist.barrier() # wait for process initialization logging inside ddp_setup() to finish
+        else:
+            dist.barrier(device_ids=[int(gpu_id.split(':')[-1])]) # wait for process initialization logging inside ddp_setup() to finish
         torch.cuda.empty_cache()
 
         logger.step_pytorch_profiler(pytorch_profiler_log_path) # pytorch profiler

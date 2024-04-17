@@ -25,6 +25,8 @@ import time
 import torch.distributed as dist
 from dist_utils import get_dist_info
 
+from utils import set_seed
+
 train_method = default_config['TrainMethod']
 max_step_per_episode = int(default_config['MaxStepPerEpisode'])
 
@@ -168,13 +170,16 @@ class FrameStackWrapper(gym.Wrapper):
 
 
 class StickyActionWrapper(gym.Wrapper):
-    def __init__(self, env, p):
+    def __init__(self, env, p, seed):
         super().__init__(env)
         self.last_action = 0
         self.p = p
+        self.rng = np.random.default_rng(seed)
+        
 
     def step(self, action):
-        if np.random.rand() <= self.p:
+        # if np.random.rand() <= self.p:
+        if self.rng.random() <= self.p:
             action = self.last_action
         self.last_action = action
         return self.env.step(action)
@@ -260,14 +265,16 @@ class AtariEnvironment(Environment):
         self.child_conn = child_conn
         self.daemon = True
 
+        set_seed(seed)
+
         self.GLOBAL_WORLD_SIZE, self.GLOBAL_RANK, self.LOCAL_WORLD_SIZE, self.LOCAL_RANK = get_dist_info()
 
         self.env = gym.make(env_id, render_mode="rgb_array" if is_render else None)
+        if sticky_action:
+            self.env = StickyActionWrapper(self.env, p, seed)
+        self.env = MaxAndSkipEnv(self.env, is_render, skip=4)
         # if sticky_action:
         #     self.env = StickyActionWrapper(self.env, p)
-        self.env = MaxAndSkipEnv(self.env, is_render, skip=4)
-        if sticky_action:
-            self.env = StickyActionWrapper(self.env, p)
         self.env = ResizeAndGrayScaleWrapper(self.env, h, w)
         # self.env = MaxAndSkipEnv(self.env, is_render, skip=4)
         self.env = FrameStackWrapper(self.env, history_size)
@@ -289,18 +296,23 @@ class AtariEnvironment(Environment):
         self.seed = seed
         # self.env.seed = seed
         # self.reset()
-        self.reset(seed=seed)
+        self.initial_state, _info = self.reset(seed=seed)
         # self.env.seed(seed)
+
 
     # from torch.distributed.elastic.multiprocessing.errors import record
     # @record
     def run(self):
         super(AtariEnvironment, self).run()
+
+        self.child_conn.send(self.initial_state) # send the initial reset state of the newly initialized env
+        del self.initial_state
+
         while True:
             action = self.child_conn.recv()
             # assert ...
 
-            if 'Breakout' in self.env_id: # TODO: not sure why other implementations do this. Find it out
+            if 'Breakout' in self.env_id: # # used for eliminating the <NOOP> action from the set of availble actions (i.e. avaiable actions become [1,2,3] where 0 was the <NOOP>)
                 action += 1
 
             state, reward, done, trun, info = self.env.step(action)
@@ -358,13 +370,15 @@ class MarioEnvironment(Environment):
         self.child_conn = child_conn
         self.daemon = True
 
+        set_seed(seed)
+
         self.GLOBAL_WORLD_SIZE, self.GLOBAL_RANK, self.LOCAL_WORLD_SIZE, self.LOCAL_RANK = get_dist_info()
 
         self.env = gym_super_mario_bros.make(env_id, apply_api_compatibility=True, render_mode = "rgb_array" if is_render else None)
         JoypadSpace.reset = lambda self, **kwargs: self.env.reset(**kwargs) # See: https://stackoverflow.com/questions/76509663/typeerror-joypadspace-reset-got-an-unexpected-keyword-argument-seed-when-i
         self.env = JoypadSpace(self.env, COMPLEX_MOVEMENT)
         if sticky_action:
-            self.env = StickyActionWrapper(self.env, p)
+            self.env = StickyActionWrapper(self.env, p, seed=seed)
         self.env = ResizeAndGrayScaleWrapper(self.env, h, w)
         self.env = MaxAndSkipEnv(self.env, is_render, skip=4)
         self.env = FrameStackWrapper(self.env, history_size)
@@ -387,12 +401,16 @@ class MarioEnvironment(Environment):
         self.seed = seed
         # self.env.seed = seed
         # self.reset()
-        self.reset(seed=seed)
+        self.initial_state, _info = self.reset(seed=seed)
         # self.env.seed(seed)
 
 
     def run(self):
         super(MarioEnvironment, self).run()
+
+        self.child_conn.send(self.initial_state) # send the initial reset state of the newly initialized env
+        del self.initial_state
+
         while True:
             action = self.child_conn.recv()
             # assert ...
@@ -424,7 +442,7 @@ class MarioEnvironment(Environment):
                 # state, _info = self.reset()
                 state, _info = self.reset(seed=self.seed)
 
-            self.child_conn.send([state, reward, done, trun])
+            self.child_conn.send([state, reward, done, trun, {}]) # return '{}' for visited_rooms which belonged to MontezumaRevenge Atari Env
 
             if done or trun:
                 self.child_conn.send([info['episode']['undiscounted_episode_return'], info['episode']['l'], info['episode']['num_finished_episodes']])
@@ -486,12 +504,14 @@ class ClassicControlEnvironment(Environment):
         self.child_conn = child_conn
         self.daemon = True
 
+        set_seed(seed)
+
         self.GLOBAL_WORLD_SIZE, self.GLOBAL_RANK, self.LOCAL_WORLD_SIZE, self.LOCAL_RANK = get_dist_info()
 
         self.env = gym.make(env_id, render_mode="rgb_array")
         self.env = RGBArrayAsObservationWrapper(self.env)
         # if sticky_action:
-        #     self.env = StickyActionWrapper(self.env, p)
+        #     self.env = StickyActionWrapper(self.env, p, seed=seed)
         self.env = ResizeAndGrayScaleWrapper(self.env, h, w)
         # self.env = MaxAndSkipEnv(self.env, is_render, skip=4)
         self.env = FrameStackWrapper(self.env, history_size)
@@ -514,17 +534,22 @@ class ClassicControlEnvironment(Environment):
         self.seed = seed
         # self.env.seed = seed
         # self.reset()
-        self.reset(seed=seed)
+        self.initial_state, _info = self.reset(seed=seed)
         # self.env.seed(seed)
 
     def run(self):
         super(ClassicControlEnvironment, self).run()
+
+        self.child_conn.send(self.initial_state) # send the initial reset state of the newly initialized env
+        del self.initial_state
+
         while True:
             action = self.child_conn.recv()
             # assert ...
 
 
             state, reward, done, trun, info = self.env.step(action)
+            reward = float(reward)
 
             self.rall += reward
 
@@ -537,7 +562,7 @@ class ClassicControlEnvironment(Environment):
                 # state, _info = self.reset()
                 state, _info = self.reset(seed=self.seed)
 
-            self.child_conn.send([state, reward, done, trun])
+            self.child_conn.send([state, reward, done, trun, {}]) # return '{}' for visited_rooms which belonged to MontezumaRevenge Atari Env
 
             if done or trun:
                 self.child_conn.send([info['episode']['undiscounted_episode_return'], info['episode']['l'], info['episode']['num_finished_episodes']])

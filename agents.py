@@ -19,6 +19,11 @@ from torch.profiler import ProfilerActivity
 from dist_utils import get_dist_info
 from config import args
 from model import ViT_IMPLEMENTATION
+from math import radians
+
+from utils import Env_action_space_type
+from torch.distributions.normal import Normal
+
 
 import wandb
 
@@ -27,6 +32,7 @@ class RNDAgent(nn.Module):
             self,
             input_size,
             output_size,
+            env_action_space_type,
             num_env,
             num_step,
             gamma,
@@ -45,6 +51,7 @@ class RNDAgent(nn.Module):
             device = None,
             logger:Logger=None):
         super().__init__()
+        self.env_action_space_type = env_action_space_type
 
         if int(default_config['ViT_implementation_type']) == ViT_IMPLEMENTATION.LUCIDRAINS_ViT.value:
             ViT_implementation_type = ViT_IMPLEMENTATION.LUCIDRAINS_ViT
@@ -53,7 +60,7 @@ class RNDAgent(nn.Module):
         else:
             ViT_implementation_type = None
 
-        self.model = CnnActorCriticNetwork(input_size, output_size, use_noisy_net, ViT_implementation_type=ViT_implementation_type)
+        self.model = CnnActorCriticNetwork(input_size, output_size, self.env_action_space_type, use_noisy_net, ViT_implementation_type=ViT_implementation_type)
         self.num_env = num_env
         self.output_size = output_size
         self.input_size = input_size
@@ -93,6 +100,7 @@ class RNDAgent(nn.Module):
         # for BYOL (Bootstrap Your Own Latent)
         if self.representation_lr_method == "BYOL":
             backbone_model = self.model.feature
+            self.backbone_model = backbone_model
             from BYOL import BYOL, Augment
             BYOL_projection_hidden_size = int(default_config['BYOL_projectionHiddenSize'])
             BYOL_projection_size = int(default_config['BYOL_projectionSize'])
@@ -107,6 +115,7 @@ class RNDAgent(nn.Module):
         # for Barlow-Twins
         if self.representation_lr_method == "Barlow-Twins":
             backbone_model = self.model.feature
+            self.backbone_model = backbone_model
             from BarlowTwins import BarlowTwins, Transform
             import json
             projection_sizes = json.loads(default_config['BarlowTwinsProjectionSizes'])
@@ -177,12 +186,21 @@ class RNDAgent(nn.Module):
 
     def get_action(self, state):
         state = torch.Tensor(state).type(torch.float32).to(self.device)
-        policy, value_ext, value_int = self.model(state)
-        action_prob = F.softmax(policy, dim=-1).data.cpu().numpy()
+        if self.env_action_space_type == Env_action_space_type.DISCRETE:
+            policy, value_ext, value_int = self.model(state)
+            action_prob = F.softmax(policy, dim=-1).data.cpu().numpy()
 
-        action = self.random_choice_prob_index(action_prob)
+            action = self.random_choice_prob_index(action_prob)
 
-        return action, value_ext.detach().cpu().numpy().squeeze(), value_int.detach().cpu().numpy().squeeze(), policy.detach().cpu().numpy()
+            return action, value_ext.detach().cpu().numpy().squeeze(), value_int.detach().cpu().numpy().squeeze(), policy.detach().cpu().numpy()
+
+        elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+            mu, std, value_ext, value_int = self.model(state)
+            cont_dist = Normal(mu, std)
+            action = cont_dist.sample()
+            logp_a = cont_dist.log_prob(action).sum(axis=-1).unsqueeze(-1)
+
+            return action.detach().cpu().numpy(), value_ext.detach().cpu().numpy().squeeze(), value_int.detach().cpu().numpy().squeeze(), logp_a.detach().cpu().numpy()
 
     @staticmethod
     def random_choice_prob_index(p, axis=1):
@@ -195,7 +213,7 @@ class RNDAgent(nn.Module):
 
         target_next_feature = self.rnd.target(next_obs)
         predict_next_feature = self.rnd.predictor(next_obs)
-        intrinsic_reward = (target_next_feature - predict_next_feature).pow(2).sum(1) / 2
+        intrinsic_reward = (target_next_feature - predict_next_feature).pow(2).mean(1)
 
         return intrinsic_reward.data.cpu().numpy()
     
@@ -257,7 +275,8 @@ class RNDAgent(nn.Module):
         for i in range(self.epoch):
             np.random.shuffle(sample_range)
 
-            total_loss, total_actor_loss, total_critic_loss, total_critic_loss_int, total_critic_loss_ext, total_entropy_loss, total_rnd_loss, total_representation_loss = [], [], [], [], [], [], [], []
+            total_loss, total_actor_loss, total_critic_loss, total_critic_loss_int, total_critic_loss_ext, total_entropy_loss, total_rnd_loss, total_representation_loss, \
+                total_approx_kl, total_max_kl, total_entropy, total_clipfrac = [], [], [], [], [], [], [], [], [], [], [], []
             total_grad_norm_unclipped = []
             if default_config.getboolean('UseGradClipping'):
                 total_grad_norm_clipped = []
@@ -270,14 +289,39 @@ class RNDAgent(nn.Module):
                 target_ext_batch = torch.FloatTensor(target_ext)[batch_indices].to(self.device)
                 if self.train_method in ['original_RND', 'modified_RND']:
                     target_int_batch = torch.FloatTensor(target_int)[batch_indices].to(self.device)
-                y_batch = torch.LongTensor(y)[batch_indices].to(self.device)
+                if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                    y_batch = torch.LongTensor(y)[batch_indices].to(self.device)
+                elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    y_batch = torch.FloatTensor(y)[batch_indices].to(self.device)
                 adv_batch = torch.FloatTensor(adv)[batch_indices].to(self.device)
                 if self.train_method in ['original_RND', 'modified_RND']:
                     normalized_extracted_feature_embeddings_batch = torch.FloatTensor(normalized_extracted_feature_embeddings)[batch_indices].to(self.device)
                 with torch.no_grad():
-                    policy_old_list = torch.tensor(old_policy).permute(1, 0, 2).contiguous().view(-1, self.output_size)[batch_indices].to(self.device) # --> [num_env*batch_size, output_size]
-                    m_old = Categorical(F.softmax(policy_old_list, dim=-1))
-                    log_prob_old = m_old.log_prob(y_batch)
+                    if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                        policy_old_list = torch.tensor(old_policy).permute(1, 0, 2).contiguous().view(-1, self.output_size)[batch_indices].to(self.device) # --> [num_env*batch_size, output_size]
+                        m_old = Categorical(F.softmax(policy_old_list, dim=-1))
+                        log_prob_old = m_old.log_prob(y_batch)
+
+                        if False: # for debugging
+                            policy1 = self.model(torch.FloatTensor(states).to(self.device))[0].contiguous().view(-1, self.output_size)[batch_indices].to(self.device) # This should equal to 'policy_old_list'
+                            assert torch.allclose(policy_old_list, policy1), "Something is wrong with the indexing of old_policy and y_batch correspondance !"
+
+                    elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                        log_prob_old = torch.tensor(old_policy).permute(1, 0, 2).contiguous().view(-1, 1)[batch_indices].to(self.device) # --> [num_env*batch_size, 1] # Note: old_policy corresponds to 'logp_a' values for CONTINUOUS action space
+
+                        if False: # for debugging
+                            mu1, std1, _, _  = self.model(torch.FloatTensor(states).to(self.device)) # [num_env*batch_size, 1]
+                            mu1 = mu1.contiguous().view(-1, self.output_size)[batch_indices].to(self.device) # [batch_size, 1]
+                            cont_dist1 = torch.distributions.normal.Normal(mu1, std1)
+                            logp_a1 = cont_dist1.log_prob(y_batch.unsqueeze(-1)).sum(axis=-1).unsqueeze(-1) # This should be equal to log_prob_old
+                            assert torch.allclose(log_prob_old, logp_a1), "Something is wrong with the indexing of states and y_batch correspondance !"
+
+                            # another check of the smae thing which directly uses s_batch:
+                            mu1, std1, _, _  = self.model(s_batch) # [num_env*batch_size, 1]
+                            mu1 = mu1.contiguous().view(-1, self.output_size) # [batch_size, 1]
+                            cont_dist1 = torch.distributions.normal.Normal(mu1, std1)
+                            logp_a1 = cont_dist1.log_prob(y_batch.unsqueeze(-1)).sum(axis=-1).unsqueeze(-1) # This should be equal to log_prob_old
+                            assert torch.allclose(log_prob_old, logp_a1), "Something is wrong with the indexing of states and y_batch correspondance !"
 
 
 
@@ -292,6 +336,21 @@ class RNDAgent(nn.Module):
                     mask = torch.rand(len(rnd_loss)).to(self.device)
                     mask = (mask < self.update_proportion).type(torch.FloatTensor).to(self.device)
                     rnd_loss = (rnd_loss * mask).sum() / torch.max(mask.sum(), torch.Tensor([1]).to(self.device))
+                    # Diagnostic metrics to log:
+                    with torch.no_grad():
+                        rnd_target_features_batch_dim_variance = torch.mean(torch.var(target_next_state_feature.detach(), dim=0)).cpu().numpy()
+                        rnd_target_features_feat_dim_variance = torch.mean(torch.var(target_next_state_feature.detach(), dim=1)).cpu().numpy()
+                        rnd_target_features_mean = torch.mean(target_next_state_feature.detach()).cpu().numpy()
+                        rnd_target_features_max = torch.max(torch.abs(target_next_state_feature.detach())).cpu().numpy()
+                        rnd_pred_features_batch_dim_variance = torch.mean(torch.var(predict_next_state_feature.detach(), dim=0)).cpu().numpy()
+                        rnd_pred_features_feat_dim_variance = torch.mean(torch.var(predict_next_state_feature.detach(), dim=1)).cpu().numpy()
+                        rnd_pred_features_mean = torch.mean(predict_next_state_feature.detach()).cpu().numpy()
+                        rnd_pred_features_max = torch.max(torch.abs(predict_next_state_feature.detach())).cpu().numpy()
+                        rnd_input_flattened = torch.reshape(normalized_extracted_feature_embeddings_batch, (normalized_extracted_feature_embeddings_batch.shape[0], -1)).detach() # [B, *]
+                        rnd_input_batch_dim_variance = torch.mean(torch.var(rnd_input_flattened, dim=0)).cpu().numpy()
+                        rnd_input_feat_dim_variance = torch.mean(torch.var(rnd_input_flattened, dim=1)).cpu().numpy()
+                        rnd_input_mean = torch.mean(rnd_input_flattened).cpu().numpy()
+                        rnd_input_max = torch.max(torch.abs(rnd_input_flattened)).cpu().numpy()
                 # ---------------------------------------------------------------------------------
 
 
@@ -301,10 +360,11 @@ class RNDAgent(nn.Module):
                 if (self.representation_lr_method == "BYOL") and (self.freeze_shared_backbone_during_training == False):
                     # sample image transformations and transform the images to obtain the 2 views
                     B, STATE_STACK_SIZE, H, W = s_batch.shape
-                    if default_config.getboolean('apply_same_transform_to_batch'):
-                        s_batch_views = self.data_transform(torch.reshape(s_batch, [-1, H, W])[:, None, :, :]) # -> [B*STATE_STACK_SIZE, C=1, H, W], [B*STATE_STACK_SIZE, C=1, H, W]
-                    else:
-                        s_batch_views = self.data_transform(s_batch) # -> [B, C=STATE_STACK_SIZE, H, W], [B, C=STATE_STACK_SIZE, H, W]
+                    with torch.no_grad():
+                        if default_config.getboolean('apply_same_transform_to_batch'):
+                            s_batch_views = self.data_transform(torch.reshape(s_batch, [-1, H, W])[:, None, :, :]) # -> [B*STATE_STACK_SIZE, C=1, H, W], [B*STATE_STACK_SIZE, C=1, H, W]
+                        else:
+                            s_batch_views = self.data_transform(s_batch) # -> [B, C=STATE_STACK_SIZE, H, W], [B, C=STATE_STACK_SIZE, H, W]
                     s_batch_view1, s_batch_view2 = torch.reshape(s_batch_views[0], [B, STATE_STACK_SIZE, H, W]), \
                         torch.reshape(s_batch_views[1], [B, STATE_STACK_SIZE, H, W]) # -> [B, STATE_STACK_SIZE, H, W], [B, STATE_STACK_SIZE, H, W]
                 
@@ -347,10 +407,11 @@ class RNDAgent(nn.Module):
                 if (self.representation_lr_method == "Barlow-Twins") and (self.freeze_shared_backbone_during_training == False):
                     # sample image transformations and transform the images to obtain the 2 views
                     B, STATE_STACK_SIZE, H, W = s_batch.shape
-                    if default_config.getboolean('apply_same_transform_to_batch'):
-                        s_batch_views = self.data_transform(torch.reshape(s_batch, [-1, H, W])[:, None, :, :]) # -> [B*STATE_STACK_SIZE, C=1, H, W], [B*STATE_STACK_SIZE, C=1, H, W]
-                    else:
-                        s_batch_views = self.data_transform(s_batch) # -> [B, C=STATE_STACK_SIZE, H, W], [B, C=STATE_STACK_SIZE, H, W]
+                    with torch.no_grad():
+                        if default_config.getboolean('apply_same_transform_to_batch'):
+                            s_batch_views = self.data_transform(torch.reshape(s_batch, [-1, H, W])[:, None, :, :]) # -> [B*STATE_STACK_SIZE, C=1, H, W], [B*STATE_STACK_SIZE, C=1, H, W]
+                        else:
+                            s_batch_views = self.data_transform(s_batch) # -> [B, C=STATE_STACK_SIZE, H, W], [B, C=STATE_STACK_SIZE, H, W]
                     s_batch_view1, s_batch_view2 = torch.reshape(s_batch_views[0], [B, STATE_STACK_SIZE, H, W]), \
                         torch.reshape(s_batch_views[1], [B, STATE_STACK_SIZE, H, W]) # -> [B, STATE_STACK_SIZE, H, W], [B, STATE_STACK_SIZE, H, W]
                 
@@ -390,11 +451,19 @@ class RNDAgent(nn.Module):
 
                 # --------------------------------------------------------------------------------
                 # for Proximal Policy Optimization (PPO):
-                policy, value_ext, value_int = self.model(s_batch)
-                m = Categorical(F.softmax(policy, dim=-1))
-                log_prob = m.log_prob(y_batch)
+                if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                    policy, value_ext, value_int = self.model(s_batch)
+                    m = Categorical(F.softmax(policy, dim=-1))
+                    log_prob = m.log_prob(y_batch)
 
-                ratio = torch.exp(log_prob - log_prob_old)
+                elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    mu, std, value_ext, value_int  = self.model(s_batch)
+                    mu = mu.contiguous().view(-1, self.output_size) # [batch_size, 1]
+                    m = torch.distributions.normal.Normal(mu, std)
+                    log_prob = m.log_prob(y_batch.unsqueeze(-1)).sum(axis=-1).unsqueeze(-1)
+
+
+                ratio = torch.exp(log_prob - log_prob_old) # Note that for the first pass (i.e. epoch=0) ratio has to equal 1
 
                 surr1 = ratio * adv_batch
                 surr2 = torch.clamp(
@@ -411,7 +480,13 @@ class RNDAgent(nn.Module):
 
                 critic_loss = critic_ext_loss + critic_int_loss
 
-                entropy = m.entropy().mean()
+                entropy = m.entropy().mean() # note that this is used both for loss calculation and logging
+                # PPO's diagnostic logging metrics (refer to: https://spinningup.openai.com/en/latest/_modules/spinup/algos/pytorch/ppo/ppo.html):
+                with torch.no_grad():
+                    approx_kl = (log_prob_old - log_prob).detach().mean().item()
+                    max_kl = (log_prob_old - log_prob).detach().max().item()
+                    clipped = ratio.gt(1+self.ppo_eps) | ratio.lt(1-self.ppo_eps)
+                    clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
                 # --------------------------------------------------------------------------------
 
                 self.optimizer.zero_grad()
@@ -440,9 +515,13 @@ class RNDAgent(nn.Module):
                     total_critic_loss_int.append(0.5 * critic_int_loss.detach().cpu().item())
                 total_critic_loss_ext.append(0.5 * critic_ext_loss.detach().cpu().item())
                 total_entropy_loss.append(- self.ent_coef * entropy.detach().cpu().item())
+                total_entropy.append(entropy.detach().cpu().item())
+                total_approx_kl.append(approx_kl)
+                total_max_kl.append(max_kl)
+                total_clipfrac.append(clipfrac)
                 if self.rnd is not None:
                     total_rnd_loss.append(rnd_loss.detach().cpu().item())
-                if self.representation_model is not None:
+                if (self.representation_model is not None) and (self.freeze_shared_backbone_during_training == False):
                     total_representation_loss.append(self.representation_loss_coef * representation_loss.detach().cpu().item())
                 total_grad_norm_unclipped.append(grad_norm_unclipped)
                 if default_config.getboolean('UseGradClipping') == True:
@@ -455,7 +534,7 @@ class RNDAgent(nn.Module):
 
                 self.logger.step_pytorch_profiler(pytorch_profiler_log_path)
 
-            
+
             # logging (wandb):
             if self.logger.use_wandb and GLOBAL_RANK == 0:
                 epoch_log_dict = {
@@ -464,27 +543,39 @@ class RNDAgent(nn.Module):
                     'train/PPO_critic_loss (intrinsic + extrinsic) vs epoch': np.mean(total_critic_loss),
                     'train/PPO_critic_loss (extrinsic) vs epoch': np.mean(total_critic_loss_ext),
                     'train/PPO_entropy_loss vs epoch': np.mean(total_entropy_loss),
+                    'train/PPO entropy vs epoch': np.mean(total_entropy),
+                    'train/PPO approximate_KL vs epoch': np.mean(total_approx_kl),
+                    'train/PPO max_KL vs epoch': np.max(total_max_kl),
+                    'train/PPO clipfrac vs epoch': np.mean(total_clipfrac),
+                    'train/grad_norm_unclipped vs epoch': np.mean(total_grad_norm_unclipped),
                 }
                 if self.rnd is not None:
                     epoch_log_dict = {
                         **epoch_log_dict,
                         'train/PPO_critic_loss (intrtinsic) vs epoch': np.mean(total_critic_loss_int),
-                        'train/RND_loss vs epoch': np.mean(total_rnd_loss)
+                        'train/RND_loss vs epoch': np.mean(total_rnd_loss),
+                        'train/rnd_target_features_batch_dim_variance vs epoch': rnd_target_features_batch_dim_variance,
+                        'train/rnd_target_features_feat_dim_variance vs epoch': rnd_target_features_feat_dim_variance,
+                        'train/rnd_target_features_mean vs epoch': rnd_target_features_mean,
+                        'train/rnd_target_features_max vs epoch': rnd_target_features_max,
+                        'train/rnd_pred_features_batch_dim_variance vs epoch': rnd_pred_features_batch_dim_variance,
+                        'train/rnd_pred_features_feat_dim_variance vs epoch': rnd_pred_features_feat_dim_variance,
+                        'train/rnd_pred_features_mean vs epoch': rnd_pred_features_mean,
+                        'train/rnd_pred_features_max vs epoch': rnd_pred_features_max,
+                        'train/rnd_input_batch_dim_variance vs epoch': rnd_input_batch_dim_variance,
+                        'train/rnd_input_feat_dim_variance vs epoch': rnd_input_feat_dim_variance,
+                        'train/rnd_input_mean vs epoch': rnd_input_mean,
+                        'train/rnd_input_max vs epoch': rnd_input_max,
                     }
                 if self.representation_model is not None:
                     epoch_log_dict = {
                         **epoch_log_dict,
                         f'train/Representation_loss({self.representation_lr_method}) vs epoch': np.mean(total_representation_loss),
                     }
-                if default_config.getboolean('verbose_logging') == True:
+                if default_config.getboolean('UseGradClipping') == True:
                     epoch_log_dict = {
                         **epoch_log_dict,
-                        'grads/grad_norm_unclipped': np.mean(total_grad_norm_unclipped),
-                    }
-                    if default_config.getboolean('UseGradClipping') == True:
-                        epoch_log_dict = {
-                            **epoch_log_dict,
-                            'grads/grad_norm_clipped': np.mean(total_grad_norm_clipped)
+                        'train/grad_norm_clipped vs epoch': np.mean(total_grad_norm_clipped),
                         }
                 epoch_log_dict = {f'wandb_{k}': v for (k, v) in epoch_log_dict.items()}
                 epoch = self.logger.tb_global_steps['epoch']
@@ -500,15 +591,31 @@ class RNDAgent(nn.Module):
             self.logger.log_scalar_to_tb_without_step('train/PPO_critic_loss (intrinsic + extrinsic) vs epoch', np.mean(total_critic_loss), only_rank_0=True)
             self.logger.log_scalar_to_tb_without_step('train/PPO_critic_loss (extrinsic) vs epoch', np.mean(total_critic_loss_ext), only_rank_0=True)
             self.logger.log_scalar_to_tb_without_step('train/PPO_entropy_loss vs epoch', np.mean(total_entropy_loss), only_rank_0=True)
+            self.logger.log_scalar_to_tb_without_step('train/PPO entropy vs epoch', np.mean(total_entropy), only_rank_0=True)
+            self.logger.log_scalar_to_tb_without_step('train/PPO approximate_KL vs epoch', np.mean(total_approx_kl), only_rank_0=True)
+            self.logger.log_scalar_to_tb_without_step('train/PPO max_KL vs epoch', np.max(total_max_kl), only_rank_0=True)
+            self.logger.log_scalar_to_tb_without_step('train/PPO clipfrac vs epoch', np.mean(total_clipfrac), only_rank_0=True)
+            self.logger.log_scalar_to_tb_without_step('train/grad_norm_unclipped vs epoch', np.mean(total_grad_norm_unclipped), only_rank_0=True)
             if self.rnd is not None:
                 self.logger.log_scalar_to_tb_without_step('train/PPO_critic_loss (intrtinsic) vs epoch', np.mean(total_critic_loss_int), only_rank_0=True)
                 self.logger.log_scalar_to_tb_without_step('train/RND_loss vs epoch', np.mean(total_rnd_loss), only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_target_features_batch_dim_variance vs epoch', rnd_target_features_batch_dim_variance, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_target_features_feat_dim_variance vs epoch', rnd_target_features_feat_dim_variance, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_target_features_mean vs epoch', rnd_target_features_mean, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_target_features_max vs epoch', rnd_target_features_max, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_pred_features_batch_dim_variance vs epoch', rnd_pred_features_batch_dim_variance, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_pred_features_feat_dim_variance vs epoch', rnd_pred_features_feat_dim_variance, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_pred_features_mean vs epoch', rnd_pred_features_mean, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_pred_features_max vs epoch', rnd_pred_features_max, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_input_batch_dim_variance vs epoch', rnd_input_batch_dim_variance, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_input_feat_dim_variance vs epoch', rnd_input_feat_dim_variance, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_input_mean vs epoch', rnd_input_mean, only_rank_0=True)
+                self.logger.log_scalar_to_tb_without_step('train/rnd_input_max vs epoch', rnd_input_max, only_rank_0=True)
             if self.representation_model is not None:
                 self.logger.log_scalar_to_tb_without_step(f'train/Representation_loss({self.representation_lr_method}) vs epoch', np.mean(total_representation_loss), only_rank_0=True)
+            if default_config.getboolean('UseGradClipping') == True:
+                self.logger.log_scalar_to_tb_without_step('train/grad_norm_clipped vs epoch', np.mean(total_grad_norm_clipped), only_rank_0=True)
             if default_config.getboolean('verbose_logging') == True:
-                self.logger.log_scalar_to_tb_without_step('grads/grad_norm_unclipped', np.mean(total_grad_norm_unclipped), only_rank_0=True)
-                if default_config.getboolean('UseGradClipping') == True:
-                    self.logger.log_scalar_to_tb_without_step('grads/grad_norm_clipped', np.mean(total_grad_norm_clipped), only_rank_0=True)
                 # Log final model parameters in detail
                 self.logger.log_parameters_in_model_to_tb_without_step(self.model, f'PPO', only_rank_0=True)
                 if self.rnd is not None:
@@ -527,8 +634,12 @@ class RNDAgent(nn.Module):
                 def graph_forward(dummy_state_batch):
                     return_vals = []
                     if self.model is not None: # PPO
-                        policy, value_ext, value_int = self.model(dummy_state_batch)
-                        return_vals += [policy, value_ext, value_int]
+                        if self.model.env_action_space_type == Env_action_space_type.DISCRETE:
+                            policy, value_ext, value_int = self.model(dummy_state_batch)
+                            return_vals += [policy, value_ext, value_int]
+                        elif self.model.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                            mu, std, value_ext, value_int = self.model(dummy_state_batch)
+                            return_vals += [mu, std, value_ext, value_int]
                     if self.representation_model is not None: # Representation model
                         representation_output = self.representation_model(dummy_state_batch, dummy_state_batch)
                         return_vals += [representation_output]

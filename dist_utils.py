@@ -14,7 +14,7 @@ def get_dist_info():
     return GLOBAL_WORLD_SIZE, GLOBAL_RANK, LOCAL_WORLD_SIZE, LOCAL_RANK
 
 
-def ddp_setup(logger, use_cuda):
+def ddp_setup(logger, use_cuda, gpu_id):
     """
     Setups torch.distributed and creates p_groups for training.
     In every node, the processes created by torch distributed (i.e. processes belonging to the default process group), will act 
@@ -61,9 +61,13 @@ def ddp_setup(logger, use_cuda):
     if use_cuda:
         assert torch.cuda.is_available() == True, "use_cuda:True is passed but cuda is not available !"
 
-    if torch.cuda.is_available() and use_cuda:
+    if torch.cuda.is_available() and use_cuda and (gpu_id == -1):
         gpu_id = "cuda:" + str(LOCAL_RANK % torch.cuda.device_count())
         backend = "nccl"
+    elif torch.cuda.is_available() and use_cuda and (gpu_id != -1):
+        gpu_id = "cuda:" + str(gpu_id)
+        backend = "nccl"
+        assert GLOBAL_WORLD_SIZE == 1, "when --gpu_id is passed then the GLOBAL_WORLD_SIZE must be 1"
     else:
         gpu_id = "cpu"
         backend = "gloo"
@@ -88,7 +92,11 @@ def create_parallel_env_processes(num_env_per_process, env_type, env_id, sticky_
     GLOBAL_WORLD_SIZE, GLOBAL_RANK, LOCAL_WORLD_SIZE, LOCAL_RANK = get_dist_info()
 
     if default_config['EnvType'] == 'atari': # other env_type's raise a pickling related error
-        mp.set_start_method('spawn') # required to avoid python's GIL issue, (also logger cannot be passed to env process constructor, see the issue: https://discuss.pytorch.org/t/thread-lock-object-cannot-be-pickled-when-using-pytorch-multiprocessing-package-with-spawn-method/184953)
+        # mp.set_start_method('spawn', force=True) # required to avoid python's GIL issue, (also logger cannot be passed to env process constructor, see the issue: https://discuss.pytorch.org/t/thread-lock-object-cannot-be-pickled-when-using-pytorch-multiprocessing-package-with-spawn-method/184953)
+        try:
+            mp.set_start_method('spawn')
+        except RuntimeError:
+            pass
 
     env_workers = []
     parent_conns = []
@@ -97,8 +105,8 @@ def create_parallel_env_processes(num_env_per_process, env_type, env_id, sticky_
         parent_conn, child_conn = Pipe()
         
         from copy import deepcopy
-        env_worker = env_type(env_id=env_id, is_render=False, env_idx=GLOBAL_RANK, sticky_action=sticky_action, p=action_prob, h=input_size, w=input_size,
-                            life_done=life_done, history_size=stateStackSize, seed=seed+idx, child_conn=child_conn) # Note that seed+rank is required to make parallel envs play different scenarios
+        env_worker = env_type(env_id=env_id, is_render=False, env_idx=(GLOBAL_RANK*num_env_per_process)+idx, sticky_action=sticky_action, p=action_prob, h=input_size, w=input_size,
+                            life_done=life_done, history_size=stateStackSize, seed=seed+((GLOBAL_RANK*num_env_per_process)+idx), child_conn=child_conn) # Note that seed+rank is required to make parallel envs play different scenarios
         env_worker.start()
         env_workers.append(env_worker)
         parent_conns.append(parent_conn)

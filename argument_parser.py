@@ -24,6 +24,8 @@ def get_args():
     parser.add_argument("--scalene_profiling", type=int, default=-1, const=0, nargs='?', help="Uses scalene profiler. Pass this option an integer to specify the number of rollouts (i.e. calls to agent.train_model()) to execute before terminating the profiling process. -1 indicates scalene profiling is off.")
     parser.add_argument("--use_wandb", type=bool, default=False, const=True, nargs='?', help="If True, then wandb is also used for logging, else ony tensorboard is used. Defaults to using both wandb and tensorboard (True)")
     parser.add_argument("--wandb_api_key", type=str, default='', const=True, nargs='?', help="If passed, then 'WANDB_API_KEY' environment variable is set to your passed in value and this is used to login to wandb.")
+    parser.add_argument("--debug_params", type=str, default='', const=True, nargs='?', help="If passed, then '--num_env_per_process=4, NumStep=16, and ObsNormStep=5 is set. This serves as a helper to check that SLURM submit.sh files are working as intended.'")
+    parser.add_argument("--gpu_id", type=int, default='-1', const=True, nargs='?', help="If passed (non-zero int), then only the specified cuda device will be used. For example, passing --gpu_id=0 will lead to toch.device('cuda:0') being used.")
 
     # args = vars(parser.parse_args())
 

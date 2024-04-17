@@ -6,6 +6,7 @@ import numpy as np
 import math
 from torch.nn import init
 from config import default_config
+from utils import Env_action_space_type
 from vit import ViT_Attn, ViT
 from transformers import ViTConfig
 from vit_hg import ViT_ExplorativeAttn
@@ -87,10 +88,18 @@ class CnnActorCriticNetwork(nn.Module):
     # self.extracted_feature_embedding_dim  = 448
     extracted_feature_embedding_dim  = int(default_config['extracted_feature_embedding_dim']) # TODO: make this corerspond to ViT's extracted feature embedding dim so that modified_rnd and SSL parts of the code can be used again
 
-    def __init__(self, input_size, output_size, use_noisy_net=False, ViT_implementation_type: ViT_IMPLEMENTATION=ViT_IMPLEMENTATION.LUCIDRAINS_ViT):
+    def __init__(self, input_size, output_size, env_action_space_type, use_noisy_net=False, ViT_implementation_type: ViT_IMPLEMENTATION=ViT_IMPLEMENTATION.LUCIDRAINS_ViT):
         super(CnnActorCriticNetwork, self).__init__()
+        self.env_action_space_type = env_action_space_type
         self.ViT_implementation_type = ViT_implementation_type
         assert isinstance(ViT_implementation_type, ViT_IMPLEMENTATION), 'ViT_implementation_type must be of type enum ViT_IMPLEMENTATION'
+
+        if self.env_action_space_type == Env_action_space_type.DISCRETE:
+            pass
+        elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+            log_std = -0.5 * np.ones(output_size, dtype=np.float32)
+            self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
+
 
         if use_noisy_net:
             print('use NoisyNet')
@@ -208,15 +217,25 @@ class CnnActorCriticNetwork(nn.Module):
                 encoder_stride=int(default_config['ViTHG_encoder_stride']),
             )
             self.feature = ViT_ExplorativeAttn(ViT_config, add_pooling_layer=True, use_mask_token=False, use_explorativeAttn=default_config.getboolean('ViTHG_use_explorativeAttn'))
+            assert ViT_dim == self.extracted_feature_embedding_dim, "In the provided config file the params 'ViTlucidrains_dim' and 'VitHG_hidden_size' should equal 'extracted_feature_embedding_dim'."
 
 
 
         # --------------- Visition Transformer Heads Used by all of available ViT implementations:
-        self.actor = nn.Sequential(
-            linear(ViT_dim, ViT_dim),
-            nn.ReLU(),
-            linear(ViT_dim, output_size)
-        )
+        # Discrete/Continuous Actor Heads:
+        if self.env_action_space_type == Env_action_space_type.DISCRETE:
+            self.actor = nn.Sequential(
+                linear(ViT_dim, ViT_dim),
+                nn.ReLU(),
+                linear(ViT_dim, output_size)
+            )
+        elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+            self.actor = nn.Sequential(
+                linear(ViT_dim, ViT_dim),
+                nn.ReLU(),
+                linear(ViT_dim, output_size),
+                nn.Tanh() # output range [-1, 1]
+            )
 
         self.extra_layer = nn.Sequential(
             linear(ViT_dim, ViT_dim),
@@ -225,6 +244,23 @@ class CnnActorCriticNetwork(nn.Module):
 
         self.critic_ext = linear(ViT_dim, 1)
         self.critic_int = linear(ViT_dim, 1)
+
+
+        init.orthogonal_(self.critic_ext.weight, 0.01)
+        self.critic_ext.bias.data.zero_()
+
+        init.orthogonal_(self.critic_int.weight, 0.01)
+        self.critic_int.bias.data.zero_()
+
+        for i in range(len(self.actor)):
+            if type(self.actor[i]) == nn.Linear:
+                init.orthogonal_(self.actor[i].weight, 0.01)
+                self.actor[i].bias.data.zero_()
+
+        for i in range(len(self.extra_layer)):
+            if type(self.extra_layer[i]) == nn.Linear:
+                init.orthogonal_(self.extra_layer[i].weight, 0.1)
+                self.extra_layer[i].bias.data.zero_()
         
 
     def forward(self, state, attn_aggregation_op='mean'):
@@ -253,14 +289,22 @@ class CnnActorCriticNetwork(nn.Module):
                 else:
                     assert attn_aggregation_op in ['mean', 'sum'], 'attention_aggregation_op must be one of ["mean", "sum"]'
 
-                policy = self.actor(x_combined) # [num_env * num_step, ViT_dim
+                if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                    policy = self.actor(x_combined) # [num_env * num_step, ViT_dim
+                elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    mu = self.actor(x_combined) # [num_env * num_step, ViT_dim
+                    std = torch.exp(self.log_std)
             
             else: # Regular ViT attention with CLS Token
                 # CLS Token Attention:
                 x_cls = self.feature(state, attn_type=ViT_Attn.CLS_ATTN) # [num_env * num_step, ViT_dim]
                 value_int = self.critic_int(self.extra_layer(x_cls) + x_cls) # [num_env * num_step, 1]
                 value_ext = self.critic_ext(self.extra_layer(x_cls) + x_cls) # [num_env * num_step, 1]
-                policy = self.actor(x_cls) # [num_env * num_step, ViT_dim
+                if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                    policy = self.actor(x_cls) # [num_env * num_step, ViT_dim
+                elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    mu = self.actor(x_cls) # [num_env * num_step, ViT_dim
+                    std = torch.exp(self.log_std)
         
 
         elif self.ViT_implementation_type == ViT_IMPLEMENTATION.HG_ViT:
@@ -285,7 +329,11 @@ class CnnActorCriticNetwork(nn.Module):
                 else:
                     assert attn_aggregation_op in ['mean', 'sum'], 'attention_aggregation_op must be one of ["mean", "sum"]'
 
-                policy = self.actor(x_combined) # [num_env * num_step, ViT_dim
+                if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                    policy = self.actor(x_combined) # [num_env * num_step, ViT_dim
+                elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    mu = self.actor(x_combined) # [num_env * num_step, ViT_dim
+                    std = torch.exp(self.log_std)
 
             else: # Regular ViT attention with CLS Token
                 # CLS Token Attention:
@@ -293,10 +341,17 @@ class CnnActorCriticNetwork(nn.Module):
                 x_cls = cls_BaseModelOutputWithPooling[0][:, 0, :] # extract CLS TOKEN's embeddings -> [num_env * num_step, ViT_dim]
                 value_int = self.critic_int(self.extra_layer(x_cls) + x_cls) # [num_env * num_step, 1]
                 value_ext = self.critic_int(self.extra_layer(x_cls) + x_cls) # [num_env * num_step, 1]
-                policy = self.actor(x_cls) # [num_env * num_step, ViT_dim
+                if self.env_action_space_type == Env_action_space_type.DISCRETE:
+                    policy = self.actor(x_cls) # [num_env * num_step, ViT_dim
+                elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+                    mu = self.actor(x_cls) # [num_env * num_step, ViT_dim
+                    std = torch.exp(self.log_std)
 
 
-        return policy, value_ext, value_int
+        if self.env_action_space_type == Env_action_space_type.DISCRETE:
+            return policy, value_ext, value_int
+        elif self.env_action_space_type == Env_action_space_type.CONTINUOUS:
+            return mu, std, value_ext, value_int
 
 
 class RNDModel(nn.Module):
@@ -404,5 +459,3 @@ class RNDModel(nn.Module):
         predict_feature = self.predictor(next_obs)
 
         return predict_feature, target_feature
-
-
