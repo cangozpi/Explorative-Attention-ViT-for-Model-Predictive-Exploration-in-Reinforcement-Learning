@@ -1,7 +1,61 @@
 # Explorative Attention ViT for Model-Predictive Exploration in Reinforcement Learning
 
+## VIT with Explorative Attention
+
+<img src="./assets/architecture overview.png" width="100%" title="Overview of the ViT with Explorative Attention approach.">
+
+Figure: Overview of the ViT with Explorative Attention approach.
+
+<img src="./assets/intuitive visualization.png" width="70%" title="Intutitive visualization of the Explorative Attention Mechanism">
+
+Figure: An intuitive visualization of how the Explorative Attention Module
+should ideally work is shown. The image on the left demonstrates that exploitative
+attention should pay attention to the skulls. The image in the middle shows that
+explorative attention should pay attention to the ladder. The image on the right
+shows the outcome of aggregating the explorative and exploitative attention features.
+
 ## Motivation:
-We introduce ViT with explorative attention mechanism. It learns intrinsic reward (exploration) related representations from an _exploration_token_ and extrinsic reward (exploitation) related representations from an _exploitation_token_. We test train this modified ViT model (i.e. ViT_ExplorativeAttn) on OpenAI GYM's MontezumaRevenge environment which is a sparse reward, hard exploration problem. Extrinsic rewards are returned by the environment, and the intrinsic rewards are obtained from Random Network Distillation (RND). Following from the RND paper we use Proximal Policy Optimization (PPO) to train the reinforcement learning agent.
+Inspired by the success of transformers in vision and sequential decision making
+tasks, we aimed to harness their strengths for exploration problems in reinforcement
+learning. Our goal was to improve learned representations by learning two different
+representations specific to exploration and exploitation. We believed that successful
+implementation of this idea could lead to learning better representations through
+architectural changes alone, without the need for SSL. This approach can be viewed
+as representation learning through architectural changes for prediction-error based
+exploration methods in reinforcement learning. Among available transformer mod-
+els for vision, we chose to build upon the Vision Transformer (ViT) architecture
+([Dosovitskiy et al., 2021]) due to its widespread use in research and the availability
+of its code implementation.
+
+We wanted to modify the ViT architecture so that it could learn where in the input
+images to pay attention for exploration and where to focus for exploitation. For in-
+stance, the explorative attention (exploration related attention) should learn to pay
+attention to exploration related features in a given input image, such as unexplored
+doors and ladders in the Montezuma’s Revenge environment, as these can lead to
+the exploration of new rooms, indicative of the exploratory behaviour. On the other
+hand, the exploitative attention (exploitation related attention) should learn to pay
+attention to exploitation related features in a given input image, such as skulls and
+lava on the floor in the Montezuma’s Revenge environment, as these can harm the
+agent and impact the extrinsic rewards (refer to the Figure).
+
+We wanted our proposed architecture to use the extracted explorative features for
+predicting intrinsic rewards using PPO’s intrinsic value head, and to use the ex-
+ploitative features for predicting extrinsic rewards using PPO’s extrinsic value head.
+Both sets of extracted features (extracted explorative features and the extracted
+exploitative features) are aggregated (we used element-wise summation) to predict
+the next action using PPO’s policy head. We aggregate the features because we
+want the policy to consider both exploration related features and exploitation re-
+lated features when making a decision.
+
+The explorative features are extracted by appending a learnable exploration token
+in front of the sequence of image patches and using the exploration token’s query
+vector to obtain the exploration features. Similarly, the exploitative features are
+extracted by appending a learnable exploitation token in front of the sequence of
+image patches and using the exploitation token’s query vector to obtain the exploita-
+tion features. This proposed ViT architecture, which we called Vit with Explorative
+Attention, serves as a backbone that replaces the convolutional PPO backbone in
+the RND approach. We tested this idea with RND, but it could be adapted for
+other methods that provide intrinsic rewards.
 
 ---
 
@@ -18,54 +72,46 @@ _Note: developed using python==3.8.16, pip==23.0.1, ubuntu==22.04.3_
     ```bash
     conda create --name <env> python=3.8.16 --file requirements.txt
     ```
-## Usage:
+## Running:
+* __Configurations__:
+    * Most of the running parameters/options are set inside a config file (_*.conf_). These files are located in _./configs_ directory. An explanation of the available options can be found by running:
+        ```bash
+        python3 main.py --train --config_options
+        ```
+    * Once you have a config file, you need to provide command line arguments to specify some other options. An explanation of the available command line options can be found by running:
+        ```bash
+        python3 main.py -h
+        ```
+    ---
 
-* Training RND only:
-    Use a config file with _RepresentationLearningParameter = None_.
-* Train RND + BYOL:
-    Use a config file with _RepresentationLearningParameter = BYOL_.
-* Train RND + Barlow-Twins:
-    Use a config file with _RepresentationLearningParameter = Barlow-Twins_.
-
+    See the available SLURM job scrips under _configs/*_.
 
 ---
-
-### Torchrun Distributed Training/Testing (Example):
-
-* Train RND agent in MontezumaRevenge from scratch:
-    ```bash
-    torchrun --nnodes 1 --nproc_per_node 2 --standalone main.py --train --num_env_per_process 64 --config_path=./configs/MontezumaRevenge/config_rnd00.conf --log_name=MontezumaRevenge_rnd00 --save_model_path=checkpoints/MontezumaRevenge/rnd00.ckpt
-    ```
-
-* Continue Training RND agent from a checkpoint in MontezumaRevenge:
+* Continue Training RND agent from a checkpoint in Montezuma's Revenge:
     1. set _loadModel = True_ in the corresponding config file.
     ```bash
-    torchrun --nnodes 1 --nproc_per_node 2 --standalone main.py --train --num_env_per_process 64 --config_path=./configs/MontezumaRevenge/config_rnd00.conf --log_name=MontezumaRevenge_rnd00_cont00 --save_model_path=checkpoints/MontezumaRevenge/rnd00_cont00.ckpt --load_model_path=checkpoints/MontezumaRevenge/rnd00.ckpt
+    torchrun --nnodes 1 --nproc_per_node 1 --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 --rdzv-id=32 main.py --train --num_env_per_process 64 --config_path=./configs/expGlados3/Montezuma/config_originalRND_NoSSL_VitExplorativeAttnLucidrains.conf --log_name=montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed42_expGlados3-2_cont00 --save_model_path=checkpoints/expGlados3/Montezuma/montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed42_expGlados3-2_cont00.ckpt --seed=42 --gpu_id=1 --use_wandb --wandb_api_key=d012c9698bf568b1807b1cfe9ed56611311573e8
     ```
-* Note that this examples uses 1 node and 128 processes in total. It will have 1 process as agent/trainer and another 127 processes as environment workers. You can modify the parameters of torchrun to suit your needs.
+* Note that this examples uses 1 node and 64 processes in total. It will have 1 process as agent/trainer and another 64 processes as environment workers. You can modify the parameters of torchrun to suit your needs.
 
 ---
-* Test a RND agent in MontezumaRevenge:
+* Test a trained agent in Montezuma's Revenge:
+    1. set _loadModel = True_ in the corresponding config file.
+    2. use _--eval_ command line argument when running the code.
     ```bash
-    torchrun --nnodes 1 --nproc_per_node 2 --standalone main.py --eval --config_path=./configs/demo_config.conf --log_name=MontezumaRevenge_rnd00 --load_model_path=checkpoints/rnd00.ckpt
+    torchrun --nnodes 1 --nproc_per_node 1 --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 --rdzv-id=34 main.py --eval --num_env_per_process 1 --config_path=./configs/expGlados3/Montezuma/config_originalRND_NoSSL_VitExplorativeAttnLucidrains.conf --log_name=montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed43_expGlados3-4_eval --load_model_path=checkpoints/expGlados3/Montezuma/montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed43_expGlados3-4.ckpt --seed=42 --use_wandb --wandb_api_key=d012c9698bf568b1807b1cfe9ed56611311573e8
     ```
-* Note that nproc_per_node has to be 2 for testing of the agent. This is because it supports only a single environment worker during training.
 
 ---
 ### Profiling
-* Profiling with Scalene (Example):
-    ```bash
-    scalene --no-browser --cpu --gpu --memory --outfile profile_rnd_montezuma.html --profile-interval 120 main.py --train --config_path=./configs/demo_config.conf --log_name=rnd00 --save_model_path=checkpoints/rnd00.ckpt
-
-    ```
 * Profiling with Scalene (torchrun Example):
     ```bash
-    python -m scalene --- -m torch.distributed.run --nnodes 1 --nproc_per_node 3 --standalone main.py --train --config_path=./configs/demo_config.conf --log_name=demo_00 --save_model_path=checkpoints/demo_00.ckpt
+    python -m scalene --- -m torch.distributed.run --nnodes 1 --nproc_per_node 1 --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 --rdzv-id=32 main.py --train --num_env_per_process 64 --config_path=./configs/expGlados3/Montezuma/config_originalRND_NoSSL_VitExplorativeAttnLucidrains.conf --log_name=montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed42_expGlados3-2_cont00 --save_model_path=checkpoints/expGlados3/Montezuma/montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed42_expGlados3-2_cont00.ckpt --seed=42 --gpu_id=1 --use_wandb --wandb_api_key=d012c9698bf568b1807b1cfe9ed56611311573e8
     ```
 
 * Profiling with Pytorch Profiler (torchrun Example):
     ```bash
-    torchrun --nnodes 1 --nproc_per_node 3 --standalone main.py --train --config_path=./configs/demo_config.conf --log_name=demo_00 --save_model_path=checkpoints/demo_00.ckpt --pytorch_profiling
+    torchrun --nnodes 1 --nproc_per_node 1 --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:0 --rdzv-id=32 main.py --train --num_env_per_process 64 --config_path=./configs/expGlados3/Montezuma/config_originalRND_NoSSL_VitExplorativeAttnLucidrains.conf --log_name=montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed42_expGlados3-2_cont00 --save_model_path=checkpoints/expGlados3/Montezuma/montezuma_originalRND_NoSSL_VitExplorativeAttnLucidrains_seed42_expGlados3-2_cont00.ckpt --seed=42 --gpu_id=1 --use_wandb --wandb_api_key=d012c9698bf568b1807b1cfe9ed56611311573e8 --pytorch_profiling
     ```
 ---
 
@@ -81,90 +127,36 @@ _Note: developed using python==3.8.16, pip==23.0.1, ubuntu==22.04.3_
 
 ---
 
-## Overview
-* __Configurations__:
-    * Most of the running parameters/options are set inside a config file (_*.conf_). These files are located in _./configs_ directory. An explanation of the available options can be found by running:
-        ```bash
-        python3 main.py --train --config_options
+### Supported OpenAI GYM Environments
+* Atari (https://www.gymlibrary.dev/environments/atari/index.html):
+    * Montezuma Revenge:
+        in the config file set:
+        ```config
+        EnvType = atari
+        EnvID = MontezumaRevengeNoFrameskip-v4
         ```
-    * Once you have a config file, you need to provide command line arguments to specify some other options. An explanation of the available command line options can be found by running:
-        ```bash
-        python3 main.py -h
+    * Pong:
+        in the config file set:
+        ```config
+        EnvType = atari
+        EnvID = PongNoFrameskip-v4
         ```
-    ---
 
-* __Supported OpenAI GYM Environments__
-    * Atari (https://www.gymlibrary.dev/environments/atari/index.html):
-        * Montezuma Revenge:
-            in the config file set:
-            ```config
-            EnvType = atari
-            EnvID = MontezumaRevengeNoFrameskip-v4
-            ```
-        * Pong:
-            in the config file set:
-            ```config
-            EnvType = atari
-            EnvID = PongNoFrameskip-v4
-            ```
-
-    * Super Mario Bros (https://pypi.org/project/gym-super-mario-bros/):
-        * Super Mario Bros:
-            in the config file set:
-            ```config
-            EnvType = mario
-            EnvID = SuperMarioBros-v0
-            ```
-
-    * Classic Control (https://www.gymlibrary.dev/environments/classic_control/):
-        * Cart Pole:
-            in the config file set:
-            ```config
-            EnvType = classic_control
-            EnvID = CartPole-v1
-            ```
-    ---
-- __Distributed Training Architecture__
-    * The code relies on _torch.distributed_ package to implement distributed training. It is implemented so that every node is assigned a single agent (GPU) which gathers rollouts by interacting with the environment workers (CPU) and trains the agent. The rest of the processes in a given node are assigned as the environment workers. These processes have an instance of the gym environment and are used solely to interact with these environments in a parallelized manner. Every agent(trainer) process sends sends actions to the environment worker processes in their node and gathers interactions with the environments. Then, these interactions are used to train the model. Gradients across agent workers are synchronized by making use of the _DistributedDataParallel_ module of _torch_.
-    
-    * In every node, 1 process (process with local_rank == 0) is assigned to the agents_group, the remaining processes are
-    assigned to the env_workers_group. To get a better understanding check out the example below.
-    agents_group processes have an instance of RNDAgent and perform optimizations.
-    env_workers_group processes have an instance of the environment and perform interactions with it.
-        ```txt
-        Example:
-
-            Available from torchrun:
-                nnodes: number of nodes = 3
-                nproc_per_node: number of processes per node = 4
-            ---
-
-            ************** NODE 0:
-            LOCAL_RANK 0: GPUs --> agents_group
-            LOCAL_RANK != 0: CPUs --> env_workers_group
-            **************
-            ...
-
-            ************** NODE: 1:
-            LOCAL_RANK 0: GPUs --> agents_group
-            LOCAL_RANK != 0: CPUs --> env_workers_group
-            **************
-            ...
-
-            ************** NODE: 2:
-            LOCAL_RANK 0: GPUs --> agents_group
-            LOCAL_RANK != 0: CPUs --> env_workers_group
-            **************
-
-            -node0-  -node1-   -node2-
-            0,1,2,3  4,5,6,7  8,9,10,11    ||    agents_group_ranks=[0,4,8], env_workers_group_rank=[remaining ranks]
-            *        *        *
+* Super Mario Bros (https://pypi.org/project/gym-super-mario-bros/):
+    * Super Mario Bros:
+        in the config file set:
+        ```config
+        EnvType = mario
+        EnvID = SuperMarioBros-v0
         ```
-    ---
 
-* __Tests__
-    * _tests.py_: This file contains some tests for environment wrappers and custom environment implementations.
-
+* Classic Control (https://www.gymlibrary.dev/environments/classic_control/):
+    * Cart Pole:
+        in the config file set:
+        ```config
+        EnvType = classic_control
+        EnvID = CartPole-v1
+        ```
 ---
 
 
@@ -177,25 +169,9 @@ __Model Predictive Exploration:__
 
     ---
 
-__Non-Contrastive Representation Learning:__
-* BYOL-Explore: Exploration by Bootstrapped Prediction:
+__Transformer:__
+* An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale:
 
-    * Paper: https://arxiv.org/abs/2206.08332
+    * Paper: https://arxiv.org/abs/2010.11929
+    * Code: https://github.com/lucidrains/vit-pytorch
 
-
-* Bootstrap Your Own Latent a New Approach to Self-Supervised Learning (BYOL):
-
-    * Paper: https://arxiv.org/pdf/2006.07733.pdf
-    * Code: 
-        
-        1. https://github.com/The-AI-Summer/byol-cifar10/blob/main/ai_summer_byol_in_cifar10.py#L92
-        2. https://github.com/SaeedShurrab/Simple-BYOL/blob/master/byol.py
-        3. https://github.com/lucidrains/byol-pytorch/blob/master/byol_pytorch/byol_pytorch.py
-
-* Barlow Twins: Self-Supervised Learning via Redundancy Reduction
-
-    * Paper: https://arxiv.org/pdf/2103.03230.pdf
-    * Code:
-
-        1. https://github.com/facebookresearch/barlowtwins
-        2. https://github.com/MaxLikesMath/Barlow-Twins-Pytorch
